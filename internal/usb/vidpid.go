@@ -1,80 +1,88 @@
 package usb
 
-import "strings"
+// USB interface signatures.
+//
+// Tetherly only ever opens a device that currently exposes an RNDIS control
+// interface (the phone has "USB tethering" switched on), and only ever claims
+// that interface and its CDC data interface. Every other interface of the
+// phone — ADB, MTP, fastboot, audio — is left alone, so `adb` keeps working
+// while tethering runs.
+//
+// The original DroidTether matched any vendor-specific (0xFF) interface of a
+// known Android vendor as "RNDIS". The ADB interface is exactly that
+// (FF/42/01), so the daemon opened and claimed the phone's ADB interface even
+// with tethering off. That is gone: matching is by class triple only.
 
-// Standard RNDIS USB Interface Class, SubClass, and Protocol
 const (
-	RNDISClass    uint8 = 0xE0 // Wireless Controller
-	RNDISSubClass uint8 = 0x01 // Radio Frequency
-	RNDISProtocol uint8 = 0x03 // RNDIS
+	// RNDIS as Android exposes it with the "wceis" option (most phones,
+	// Samsung included): Wireless Controller / RF / RNDIS.
+	RNDISClass    uint8 = 0xE0
+	RNDISSubClass uint8 = 0x01
+	RNDISProtocol uint8 = 0x03
+
+	// RNDIS over the Misc class (some MediaTek / Qualcomm builds).
+	MiscClass         uint8 = 0xEF
+	MiscRNDISSubClass uint8 = 0x04
+	MiscRNDISProtocol uint8 = 0x01
+
+	// Plain Linux f_rndis without wceis: CDC Communications / ACM / vendor.
+	CDCClass       uint8 = 0x02
+	CDCACMSubClass uint8 = 0x02
+	CDCVendorProto uint8 = 0xFF
+
+	// CDC Data, the interface that carries the bulk endpoints.
+	CDCDataClass uint8 = 0x0A
+
+	// ADB: vendor class, subclass 0x42, protocol 0x01. Fastboot is protocol 0x03.
+	VendorClass uint8 = 0xFF
+	ADBSubClass uint8 = 0x42
+	ADBProtocol uint8 = 0x01
+
+	// MTP / PTP (still image class).
+	ImageClass uint8 = 0x06
 )
 
-// Known Android Manufacturer VIDs (Fallback for misbehaving devices that don't advertise RNDIS class properly)
-var knownAndroidVIDs = []uint16{
-	0x04e8, // Samsung
-	0x18d1, // Google (Pixel / Nexus)
-	0x2717, // Xiaomi
-	0x22d9, // OPPO / OnePlus
-	0x2a70, // OnePlus
-	0x0fce, // Sony Ericsson
-	0x05c6, // Qualcomm
-	0x12d1, // Huawei
-	0x2b0e, // Nothing
-	0x17ef, // Lenovo / Motorola
-	0x22b8, // Motorola
-}
-
-// ManufacturerNameKeywords matches known Android device manufacturers by string (if VID is unknown).
-var knownAndroidManufacturers = []string{
-	"android",
-	"samsung",
-	"google",
-	"oneplus",
-	"xiaomi",
-	"motorola",
-	"huawei",
-	"sony",
-	"oppo",
-	"vivo",
-	"nothing",
-	"lg",
-	"nokia",
-}
-
-// MatchRNDIS checks whether a given USB Interface matches the signature of an Android RNDIS tethering interface.
-// It returns true if the class/subclass/protocol match the RNDIS spec, or as a fallback, if the device matches
-// a known Android manufacturer VID.
-func MatchRNDIS(vid, pid uint16, class, subClass, proto uint8) bool {
-	// Primary check: Does the interface explicitly declare itself as RNDIS?
-	if class == RNDISClass && subClass == RNDISSubClass && proto == RNDISProtocol {
+// IsRNDISControl reports whether an interface triple is an RNDIS control interface.
+func IsRNDISControl(class, subClass, proto uint8) bool {
+	switch {
+	case class == RNDISClass && subClass == RNDISSubClass && proto == RNDISProtocol:
+		return true
+	case class == MiscClass && subClass == MiscRNDISSubClass && proto == MiscRNDISProtocol:
+		return true
+	case class == CDCClass && subClass == CDCACMSubClass && proto == CDCVendorProto:
 		return true
 	}
-
-	// 2. Vendor-specific fallback (0xFF or 0xEF)
-	// Many vendors (Xiaomi, Samsung) use 0xFF or 0xEF class for various USB modes.
-	if class == 0xFF || class == 0xEF {
-		// Protocol 0x03 often identifies RNDIS even in vendor-specific class
-		if proto == RNDISProtocol {
-			return true
-		}
-		// Fallback for known Android manufacturers (Samsung, Xiaomi, etc.)
-		for _, knownVID := range knownAndroidVIDs {
-			if vid == knownVID {
-				return true
-			}
-		}
-	}
-
 	return false
 }
 
-// IsKnownAndroidManufacturer checks if the manufacturer string matches a known Android manufacturer.
-func IsKnownAndroidManufacturer(manufacturer string) bool {
-	lower := strings.ToLower(manufacturer)
-	for _, kw := range knownAndroidManufacturers {
-		if strings.Contains(lower, kw) {
-			return true
-		}
-	}
-	return false
+// IsADB reports whether an interface triple is the Android Debug Bridge (or fastboot).
+func IsADB(class, subClass, proto uint8) bool {
+	return class == VendorClass && subClass == ADBSubClass
+}
+
+// Known Android vendor IDs, used only to label a plugged-in phone whose
+// tethering is off ("phone found"). Never used to decide what to claim.
+var knownAndroidVIDs = map[uint16]string{
+	0x04e8: "Samsung",
+	0x18d1: "Google",
+	0x2717: "Xiaomi",
+	0x22d9: "OPPO",
+	0x2a70: "OnePlus",
+	0x0fce: "Sony",
+	0x05c6: "Qualcomm",
+	0x12d1: "Huawei",
+	0x2b0e: "Nothing",
+	0x17ef: "Lenovo",
+	0x22b8: "Motorola",
+	0x1004: "LG",
+	0x2d95: "vivo",
+	0x0bb4: "HTC",
+	0x2e04: "HMD",
+	0x1ebf: "Fairphone",
+}
+
+// AndroidVendor returns a vendor name for a known Android VID.
+func AndroidVendor(vid uint16) (string, bool) {
+	name, ok := knownAndroidVIDs[vid]
+	return name, ok
 }

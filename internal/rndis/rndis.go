@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/princePal/droidtether/internal/usb"
+	"github.com/mihasm/tetherly/internal/usb"
 	"github.com/rs/zerolog/log"
 )
 
@@ -107,6 +107,16 @@ func (s *Session) Handshake() ([]byte, error) {
 
 	log.Info().Str("component", "rndis").Msg("RNDIS handshake complete. Device in DATA mode.")
 	return macCmplt.Payload, nil
+}
+
+// Halt tells the phone the host is done (REMOTE_NDIS_HALT_MSG, no reply).
+func (s *Session) Halt() error {
+	s.requestID++
+	b := make([]byte, 12)
+	binary.LittleEndian.PutUint32(b[0:4], MsgHalt)
+	binary.LittleEndian.PutUint32(b[4:8], 12)
+	binary.LittleEndian.PutUint32(b[8:12], s.requestID)
+	return s.sendControl(b)
 }
 
 // KeepAlive sends a REMOTE_NDIS_KEEPALIVE_MSG to keep the connection active.

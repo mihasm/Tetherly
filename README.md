@@ -1,150 +1,90 @@
-# 📱 DroidTether
+# Tetherly
 
-**Seamless Android RNDIS USB tethering for Apple Silicon Macs.**
-*No Kernel Extensions. No SIP Changes. No Reboots.* 🚀
+Android USB tethering for Apple Silicon Macs, from the menu bar. No kernel extension, no SIP changes.
 
-![Downloads](https://img.shields.io/github/downloads/HelloPrincePal/DroidTether/total?style=for-the-badge&color=green)
-![Status](https://img.shields.io/github/v/release/HelloPrincePal/DroidTether?style=for-the-badge&color=blue)
+Plug in an Android phone, switch on **USB tethering** on the phone, click **Connect** in the menu bar. Tetherly talks RNDIS to the phone over libusb and routes the Mac's traffic through a `utun` interface.
 
-DroidTether is a lightweight userspace daemon that brings high-performance USB tethering to macOS by implementing the RNDIS protocol via `libusb` and routing traffic through the native `utun` interface.
+Tetherly is a fork of [DroidTether](https://github.com/HelloPrincePal/DroidTether) by **HelloPrincePal (Prince Pal)**, which did the hard part: the userspace RNDIS implementation, the DHCP exchange with the phone and the Samsung MAC workaround. Tetherly keeps that core and adds a menu bar app, an on-demand helper and a USB layer that leaves the rest of the phone alone. MIT licence, as upstream.
 
----
+## What it does differently from DroidTether
 
-## ✨ Why DroidTether?
+- **adb keeps working.** DroidTether's always-running daemon broke `adb` on the phone. Two causes, both fixed:
+  1. Its matcher treated any vendor-specific (`0xFF`) interface of a known Android vendor as RNDIS. ADB is exactly such an interface (`FF/42/01`), so with tethering *off* the daemon opened the phone every 500 ms and tried to use the ADB interface as its RNDIS control interface.
+  2. It enabled libusb's kernel-driver auto-detach and switched configurations. On macOS, libusb implements "detach" by re-enumerating the **whole** device in capture mode, which drops every other client of the phone, adb included.
 
-- 🔒 **Zero System Security Changes**: Unlike HoRNDIS, DroidTether runs entirely in userspace. You don't need to disable System Integrity Protection (SIP) or allow reduced security mode.
-- ⚡ **Apple Silicon Native**: Built from the ground up for M1, M2, M3, and M4 Macs.
-- 🤖 **Samsung Friendly**: Includes a specialized workaround for Samsung's dynamic MAC address randomization on tethering interfaces.
-- 🔌 **Plug & Play**: Automatically detects your phone, performs the handshake, and configures your Mac's routing/DNS instantly.
+  Tetherly finds phones by reading the I/O Registry (nothing is opened), matches RNDIS by its exact class triple only, never detaches drivers, never sends `SET_CONFIGURATION`, claims only the RNDIS control and CDC data interfaces, and releases them, the device handle and the libusb context on disconnect.
+- **Nothing runs until you want it.** The root helper is started by launchd when the app asks for the status, and exits after 90 s idle when it is not connected and auto-connect is off. It touches the phone only when you click Connect, or when you switch on auto-connect *and* the phone itself offers USB tethering.
+- **Your local networks stay local.** All traffic goes through the phone via two `/1` routes, which never override directly connected subnets. With Wi-Fi on a network without internet (an OBD adapter at `192.168.0.10`, a camera, a printer), that subnet stays on Wi-Fi and everything else uses the phone.
+- **DNS and "offline" Safari fixed.** The tether link is published to macOS as a network service with `OverridePrimary`, the way VPN clients do it. macOS then uses its DNS for all lookups and Safari, the App Store and `networkQuality` see the Mac as online, without a dummy Wi-Fi network. Nothing is written to your network preferences; it disappears on disconnect, and a helper that crashed cleans up after itself on its next start.
+- DHCP is retried until the phone answers and renewed at half the lease; the phone's own DNS servers are used; the session ends cleanly when the cable is pulled or tethering is switched off on the phone.
 
----
+## Install
 
-## 🚀 macOS 15+ (Tahoe) Compatibility Guide
+1. Download `Tetherly-<version>.zip` from [Releases](https://github.com/mihasm/Tetherly/releases), unzip it and move **Tetherly.app** to **Applications**.
+2. The build is signed ad hoc, not notarised. The first time, right-click the app and choose **Open**, or run:
+   ```bash
+   xattr -dr com.apple.quarantine /Applications/Tetherly.app
+   ```
+3. Open Tetherly, click the menu bar icon, then **Install Helper**. macOS asks you to allow it in **System Settings > General > Login Items & Extensions** (an administrator password): switch on **Tetherly**.
+4. On the phone: **Settings > Connections > Mobile Hotspot and Tethering > USB tethering** (Samsung), or **Network & internet > Hotspot & tethering > USB tethering**. Then **Connect**.
 
-macOS 15 introduces a strict "System Trust" model for network interfaces. DroidTether operates within these boundaries, leading to a split-networking experience:
+Requirements: Apple Silicon, macOS 13 or later.
 
-### ✅ Works Out-of-the-Box (Independent Apps)
-Apps that use their own internal network or DNS libraries (DNS-over-HTTPS) bypass the OS "reachability" checks and work at full speed instantly:
-*   **Browsers**: Chrome, Firefox, Brave, Microsoft Edge.
-*   **Meetings**: Google Meet, Zoom, Slack, Microsoft Teams.
-*   **Streaming**: Netflix, YouTube, Spotify, Twitch.
-*   **Developer Tools**: Any connection to a raw IP address.
+## The menu bar app
 
-### ⚠️ Safari, Chrome, and App Store Not Loading? (The macOS "Offline" Bug)
-macOS uses a `NetworkReachability` API that tells web browsers if the system is online. Because DroidTether uses a virtual `utun` interface, macOS might incorrectly tell your browsers that the system is "offline", causing them to spin endlessly even if your terminal can ping the internet.
+- State at a glance: no phone, USB tethering off, ready, connecting, connected (interface, IP, gateway, DNS, MTU, uptime, live throughput, totals) or error with a hint.
+- Connect / Disconnect, auto-connect, open at login, notifications (connected, dropped, phone ready).
+- Settings: MTU with presets (lower it if pages hang while ping works — an MTU black hole on the mobile network), route everything or only bring up the interface, primary-network DNS on or off, custom DNS servers.
+- Log window with filter, follow, copy and a link to `/Library/Logs/Tetherly/tetherly.log`.
 
-#### **The Solution (Dummy Wi-Fi Connection)**
-To trick macOS into waking up the browsers, simply **turn on your Mac's Wi-Fi**. It doesn't need to have actual internet access (you can connect it to the same mobile hotspot or a router with no internet). As long as the Wi-Fi is active, macOS will report the system as "Online", and your browsers will instantly route all traffic through the high-speed USB cable.
+## Command line
 
-#### **Native DNS Override (For CLI & App Store)**
-If Safari or CLI tools like `curl` still fail to resolve domains, force your DNS to route through the tunnel:
-```bash
-sudo networksetup -setdnsservers Wi-Fi 8.8.8.8 8.8.4.4
+Settings > Command-line tool links `~/.local/bin/tetherly`; the same commands also work as `/Applications/Tetherly.app/Contents/MacOS/Tetherly <command>`.
+
 ```
-*(To revert when done: `sudo networksetup -setdnsservers Wi-Fi empty`)*
-
-### ⚠️ Pages Hanging or Spinning Forever? (The MTU Black Hole)
-If you can ping `8.8.8.8` but websites fail to load, your mobile carrier might be dropping packets that are too large (a common 5G tethering issue). You can fix this by lowering the interface MTU to 1380:
-```bash
-# Find your utun number first via 'ifconfig' (e.g. utun6)
-sudo ifconfig utun6 mtu 1380
-```
-
----
-
-## 🛡️ Security & Privacy Posture
-
-DroidTether is built on a strict **"local-only"** and **"least-privilege"** security model. We enforce extreme transparency because system-level applications require a high degree of trust.
-
-### 🚫 Zero Telemetry & Data Sovereignty
-- **No Data Inspection**: DroidTether simply routes encrypted and unencrypted packets between the macOS kernel (`utun`) and the Android USB interface (`libusb`). It **does not** read, inspect, or modify the contents of your web traffic.
-- **No Analytics**: There is absolutely zero telemetry, tracking, or "call-home" functionality.
-- **Local Logs Only**: Operational logs reside strictly on your local machine at `/var/log/droidtether.log`.
-
-### 🔑 Why `sudo` (Root) is Required
-To function without relying on Kernel Extensions, DroidTether requires elevated OS privileges:
-1. **Virtual Interface Creation**: Creating the `utun` interface requires kernel routing permissions.
-2. **Routing Table Modification**: Injecting routes to prioritize the Android connection requires root.
-3. **Hardware USB Binding**: Opening raw protocol communication via `libusb` requires device-level access.
-
-### 📂 100% Auditable Core
-The core routing logic is written in modern Go and consists of fewer than **2,000 lines of code**, making it trivially auditable. Review our [Architecture Deep-Dive](docs/architecture.md) for more.
-
----
-
-## 🛠️ Verified Test Environment
-
-| Phone Name | Android Version | Host Name | OS Version | Results |
-| :--- | :--- | :--- | :--- | :--- |
-| Xiaomi 11 Lite NE | 14 (HyperOS 2.0) | MacBook Air M4 | macOS Tahoe | **260 Mbps** 🚀 |
-| Samsung Galaxy S24 | 16 (One UI 8.0) | MacBook Air M4 | macOS Tahoe | **290 Mbps** 🚀 |
-| Samsung Galaxy A55 | 16 (One UI 8.0) | MacBook Air M4 | macOS Tahoe | Stable ✅ |
-
----
-
-## 📦 Installation & Setup
-
-### 1. One-Liner Install
-Open your terminal and paste this command to install the binary and start the background service:
-```bash
-curl -sL https://raw.githubusercontent.com/HelloPrincePal/DroidTether/main/install.sh | bash
+tetherly status [--json]     state, interface, IP, DNS, traffic
+tetherly connect             connect and wait for an address
+tetherly disconnect          disconnect and release the phone
+tetherly logs [-f]           helper log
+tetherly config mtu=1380 auto_connect=true dns_servers=1.1.1.1,9.9.9.9
+tetherly devices             USB devices and their interfaces (read-only; attach to bug reports)
 ```
 
-### 2. Manual Build (From Source)
-```bash
-# Prerequisites: brew install libusb pkg-config
-git clone https://github.com/HelloPrincePal/DroidTether
-cd DroidTether
-make build
-sudo ./build/droidtether
+## For other programs
+
+The helper answers on `/var/run/tetherly.sock`, one JSON line each way:
+
+```
+$ echo '{"cmd":"status"}' | socat - UNIX-CONNECT:/var/run/tetherly.sock
+{"ok":true,"status":{"state":"connected","phone":{"vendor":"Samsung","product":"SM-S901B",...},
+ "interface":"utun6","ip":"192.168.42.50","gateway":"192.168.42.129","dns":["192.168.42.129","1.1.1.1"],
+ "dns_managed":true,"routed":true,"mtu":1380,"since":"2026-10-22T11:02:03+02:00",
+ "rx_bytes":1234567,"tx_bytes":234567,"auto_connect":false,"version":"0.9.0"}}
 ```
 
----
+`state` is one of `no_phone`, `phone_found` (plugged in, USB tethering off), `tethering_available`, `connecting`, `connected`, `disconnecting`, `error`. Anyone can read `status`, `logs` and `get_config`; `connect`, `disconnect` and `set_config` need an administrator or the logged-in user. Commands are listed in `internal/ipc/ipc.go`.
 
-## 📖 How to Use
+## Uninstall
 
-1. **Connect** your Android phone to your Mac via a USB-C cable.
-2. **Enable Tethering** on your phone:
-   - Go to **Settings** ⚙️ → Search for **Tethering**
-   - Toggle **USB Tethering** to **ON** ✅
-3. **Enjoy!** DroidTether will log `✨ Network auto-configured!`.
+Settings > Helper > Uninstall, quit Tetherly, move it to the Bin. Remove `/Library/Application Support/Tetherly` and `/Library/Logs/Tetherly` if you want the settings and logs gone too.
 
----
+## Build
 
-## 🔍 Verifying Connectivity
-
-### 1. Check the Service Status ⚙️
 ```bash
-sudo launchctl list | grep princePal
-# Expected: A process ID (number) should appear.
+brew install libusb pkg-config
+make app        # build/Tetherly.app and dist/Tetherly-<version>.zip
+make install    # copy into /Applications and open it
+go test ./...
 ```
 
-### 2. Check the Network Interface 📡
-```bash
-ifconfig | grep -A 5 utun
-# Expected: A 'utun' interface with an 'inet' address (e.g., 10.x.x.x)
-```
+Layout: `internal/usb` (I/O Registry discovery, interface claiming), `internal/rndis` (RNDIS control messages), `internal/tether` (packet relay, DHCP, session lifecycle), `internal/netcfg` (routes and DNS), `internal/helper` (root daemon, socket server), `cmd/tetherly-helper` (daemon and CLI), `app/` (SwiftUI menu bar app). The helper is registered with `SMAppService` from `Contents/Library/LaunchDaemons/dev.miha.tetherly.helper.plist` and runs `Contents/MacOS/tetherly-helper`; nothing is installed outside the app bundle except its settings, log and socket.
 
-### 3. Verify the Routing 🛣️
-```bash
-route -n get google.com | grep interface
-# Expected: interface: utunX
-```
+## Limits
 
-### 4. Monitor Live Traffic 📜
-```bash
-tail -f /var/log/droidtether.log
-```
+- IPv4 only (as upstream): IPv6 traffic is dropped on the tether link.
+- One phone at a time.
+- Tested phones upstream: Xiaomi 11 Lite NE, Samsung Galaxy S24, Galaxy A55.
 
----
+## Credits and licence
 
-## ⚠️ A Note on Apple's `networkQuality`
-
-If you try to run the `networkQuality` command, you may encounter an "offline" error. This is known macOS behavior where high-level system utilities sometimes only bind to physical hardware services (WiFi/Ethernet). Real-world tasks like Gaming and Video Calling are **completely unaffected**.
-
----
-
-## 🤝 Community
-*   **Contributing**: Found a bug? Please open an issue or submit a PR! Review our [Code of Conduct](CODE_OF_CONDUCT.md).
-*   **Security**: Please report vulnerabilities via our [Security Policy](.github/SECURITY.md).
-*   **License**: MIT — © PrincePal
+MIT. Copyright (c) 2026 PrincePal (DroidTether) and Miha Smrekar (Tetherly). See [LICENSE](LICENSE).

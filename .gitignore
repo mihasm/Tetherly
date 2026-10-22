@@ -1,22 +1,6 @@
-# Binary output
 /build/
-
-# IDE files
+/dist/
+.DS_Store
+*.log
 .idea/
 .vscode/
-*.swp
-*.swo
-
-# MacOS files
-.DS_Store
-
-# Go specific
-/vendor/
-*.test
-*.prof
-
-# Logs
-*.log
-
-# Scratch
-tmp/

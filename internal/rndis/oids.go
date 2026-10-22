@@ -3,6 +3,7 @@ package rndis
 // RNDIS message types (Host -> Device)
 const (
 	MsgInit          uint32 = 0x00000002
+	MsgHalt          uint32 = 0x00000003
 	MsgQuery         uint32 = 0x00000004
 	MsgSet           uint32 = 0x00000005
 	MsgReset         uint32 = 0x00000006

@@ -1,105 +1,169 @@
 package usb
 
 import (
+	"errors"
 	"fmt"
-	"time"
+
 	"github.com/google/gousb"
 )
 
-// Device wraps a gousb.Device with RNDIS specific fields and capabilities.
+// Device is an opened phone with its RNDIS control and data interfaces claimed.
+//
+// Rules that keep adb (and everything else on the phone) working:
+//   - no kernel-driver detach: on macOS libusb implements detach as a capture
+//     re-enumeration of the WHOLE device, which kicks adb off the phone;
+//   - no SET_CONFIGURATION: the RNDIS interface must be in the active
+//     configuration, otherwise we refuse instead of switching configs;
+//   - only the RNDIS control interface and its CDC Data interface are claimed;
+//   - Close releases both interfaces and the handle, and closes the libusb context.
 type Device struct {
+	ctx          *gousb.Context
 	usbd         *gousb.Device
 	usbc         *gousb.Config
 	controlIntf  *gousb.Interface
 	dataIntf     *gousb.Interface
 	InterfaceNum int
+	Info         DeviceInfo
 }
 
-// NewDevice opens and claims the RNDIS interface on the provided gousb.Device.
-func NewDevice(dev *gousb.Device) (*Device, error) {
-	var targetConfigNum, targetInterfaceNum, targetAltSettingNum int = -1, -1, -1
+// ErrNoRNDIS means the phone does not expose RNDIS (USB tethering is off).
+var ErrNoRNDIS = errors.New("the phone does not offer USB tethering right now (switch on USB tethering on the phone)")
 
-	// 1. Scan all configuration descriptors to find the best RNDIS candidate.
-	// We do this BEFORE calling dev.Config() to avoid unnecessary SET_CONFIGURATION requests.
-	for _, cfgDesc := range dev.Desc.Configs {
-		foundInConfig := false
-		for _, intfDesc := range cfgDesc.Interfaces {
-			for _, altDesc := range intfDesc.AltSettings {
-				if MatchRNDIS(uint16(dev.Desc.Vendor), uint16(dev.Desc.Product), uint8(altDesc.Class), uint8(altDesc.SubClass), uint8(altDesc.Protocol)) {
-					// Prioritize standard RNDIS class over vendor-specific if multiple found
-					if targetConfigNum == -1 || uint8(altDesc.Class) == RNDISClass {
-						targetConfigNum = cfgDesc.Number
-						targetInterfaceNum = intfDesc.Number
-						targetAltSettingNum = altDesc.Number
-						foundInConfig = true
-					}
-				}
-			}
+// Open opens the device described by info and claims only its RNDIS interfaces.
+func Open(info DeviceInfo) (*Device, error) {
+	ctx := gousb.NewContext()
+	devs, err := ctx.OpenDevices(func(desc *gousb.DeviceDesc) bool {
+		if uint16(desc.Vendor) != info.VendorID || uint16(desc.Product) != info.ProductID {
+			return false
 		}
-		if foundInConfig {
-			break
+		if info.Address >= 0 && desc.Address != info.Address {
+			return false
 		}
+		if info.Location != 0 && desc.Bus != info.Bus() {
+			return false
+		}
+		return true
+	})
+	if err != nil && len(devs) == 0 {
+		ctx.Close()
+		return nil, fmt.Errorf("usb: cannot open %s: %w", info.VIDPID, err)
 	}
-
-	if targetConfigNum == -1 {
-		return nil, fmt.Errorf("no RNDIS interface found on any device configuration")
+	if len(devs) == 0 {
+		ctx.Close()
+		return nil, fmt.Errorf("usb: %s is no longer connected", info.VIDPID)
 	}
-
-	// 2. Set AutoDetach (detaches macOS built-in driver automatically).
-	dev.SetAutoDetach(true)
-
-	// 3. Open the selected configuration.
-	usbc, err := dev.Config(targetConfigNum)
+	for _, extra := range devs[1:] {
+		extra.Close()
+	}
+	dev := devs[0]
+	d, err := claim(dev)
 	if err != nil {
-		return nil, fmt.Errorf("failed to open device config %d: %w", targetConfigNum, err)
+		dev.Close()
+		ctx.Close()
+		return nil, err
 	}
-
-	// Wait for the device to stabilize after SET_CONFIGURATION (critical for Samsung)
-	time.Sleep(250 * time.Millisecond)
-
-	// 4. Claim the control interface.
-	intf, err := usbc.Interface(targetInterfaceNum, targetAltSettingNum)
-	if err != nil {
-		usbc.Close()
-		return nil, fmt.Errorf("failed to claim RNDIS control interface %d: %w", targetInterfaceNum, err)
-	}
-
-	d := &Device{
-		usbd:         dev,
-		usbc:         usbc,
-		controlIntf:  intf,
-		InterfaceNum: targetInterfaceNum,
-	}
-
-	// 5. Proactively find and claim the Data interface.
-	// Many devices (Samsung) require the data interface to be claimed before the RNDIS handshake finishes.
-	for _, intfDesc := range usbc.Desc.Interfaces {
-		if intfDesc.Number == targetInterfaceNum {
-			continue
-		}
-		for _, alt := range intfDesc.AltSettings {
-			// Search for RNDIS Data (Class 0x0A) or general vendor-specific data
-			class := uint8(alt.Class)
-			if class == 0x0A || class == 0xFF || class == 0xEF {
-				if len(alt.Endpoints) >= 2 {
-					fmt.Printf("USB DEBUG: Proactively claiming Data Intf %d Alt %d\n", intfDesc.Number, alt.Number)
-					dataIntf, err := usbc.Interface(intfDesc.Number, alt.Number)
-					if err == nil {
-						d.dataIntf = dataIntf
-						break
-					}
-				}
-			}
-		}
-		if d.dataIntf != nil {
-			break
-		}
-	}
-
+	d.ctx = ctx
+	d.Info = info
 	return d, nil
 }
 
-// Close releases the claimed USB interfaces and config configuration.
+func claim(dev *gousb.Device) (*Device, error) {
+	active, err := dev.ActiveConfigNum()
+	if err != nil {
+		return nil, fmt.Errorf("usb: cannot read the active configuration: %w", err)
+	}
+	var cfgDesc *gousb.ConfigDesc
+	for i := range dev.Desc.Configs {
+		c := dev.Desc.Configs[i]
+		if c.Number == active {
+			cfgDesc = &c
+			break
+		}
+	}
+	if cfgDesc == nil {
+		return nil, fmt.Errorf("usb: active configuration %d has no descriptor", active)
+	}
+
+	ctrlNum, ctrlAlt := -1, 0
+	for _, intf := range cfgDesc.Interfaces {
+		for _, alt := range intf.AltSettings {
+			if IsRNDISControl(uint8(alt.Class), uint8(alt.SubClass), uint8(alt.Protocol)) {
+				ctrlNum, ctrlAlt = intf.Number, alt.Alternate
+				break
+			}
+		}
+		if ctrlNum >= 0 {
+			break
+		}
+	}
+	if ctrlNum < 0 {
+		return nil, ErrNoRNDIS
+	}
+
+	// The data interface is a CDC Data interface with a bulk IN/OUT pair,
+	// normally the one right after the control interface.
+	dataNum, dataAlt := -1, 0
+	pick := func(intf gousb.InterfaceDesc) bool {
+		for _, alt := range intf.AltSettings {
+			if uint8(alt.Class) == CDCDataClass && hasBulkPair(alt) {
+				dataNum, dataAlt = intf.Number, alt.Alternate
+				return true
+			}
+		}
+		return false
+	}
+	for _, intf := range cfgDesc.Interfaces {
+		if intf.Number == ctrlNum+1 && pick(intf) {
+			break
+		}
+	}
+	if dataNum < 0 {
+		for _, intf := range cfgDesc.Interfaces {
+			if intf.Number != ctrlNum && pick(intf) {
+				break
+			}
+		}
+	}
+	if dataNum < 0 {
+		return nil, fmt.Errorf("usb: RNDIS data interface not found")
+	}
+
+	// Config() only issues SET_CONFIGURATION when the number differs from
+	// the active one, which it never does here; autodetach stays off.
+	usbc, err := dev.Config(active)
+	if err != nil {
+		return nil, fmt.Errorf("usb: cannot use configuration %d: %w", active, err)
+	}
+	ctrl, err := usbc.Interface(ctrlNum, ctrlAlt)
+	if err != nil {
+		usbc.Close()
+		return nil, fmt.Errorf("usb: cannot claim RNDIS control interface %d: %w", ctrlNum, err)
+	}
+	data, err := usbc.Interface(dataNum, dataAlt)
+	if err != nil {
+		ctrl.Close()
+		usbc.Close()
+		return nil, fmt.Errorf("usb: cannot claim RNDIS data interface %d: %w", dataNum, err)
+	}
+	return &Device{usbd: dev, usbc: usbc, controlIntf: ctrl, dataIntf: data, InterfaceNum: ctrlNum}, nil
+}
+
+func hasBulkPair(alt gousb.InterfaceSetting) bool {
+	var in, out bool
+	for _, ep := range alt.Endpoints {
+		if ep.TransferType == gousb.TransferTypeBulk {
+			if ep.Direction == gousb.EndpointDirectionIn {
+				in = true
+			} else {
+				out = true
+			}
+		}
+	}
+	return in && out
+}
+
+// Close releases the claimed interfaces, the configuration, the device handle
+// and the libusb context. Safe to call more than once.
 func (d *Device) Close() error {
 	if d.dataIntf != nil {
 		d.dataIntf.Close()
@@ -113,80 +177,45 @@ func (d *Device) Close() error {
 		d.usbc.Close()
 		d.usbc = nil
 	}
+	if d.usbd != nil {
+		d.usbd.Close()
+		d.usbd = nil
+	}
+	if d.ctx != nil {
+		d.ctx.Close()
+		d.ctx = nil
+	}
 	return nil
 }
 
-// Control performs a vendor-specific control transfer.
+// Control performs a control transfer on the device.
 func (d *Device) Control(rType, request uint8, val, idx uint16, data []byte) (int, error) {
+	if d.usbd == nil {
+		return 0, gousb.ErrorNoDevice
+	}
 	return d.usbd.Control(rType, request, val, idx, data)
 }
 
-// OpenBulkEndpoints returns the bulk IN and OUT endpoints for data transfer.
+// OpenBulkEndpoints returns the bulk IN and OUT endpoints of the data interface.
 func (d *Device) OpenBulkEndpoints() (in *gousb.InEndpoint, out *gousb.OutEndpoint, err error) {
-	// 1. Try finding endpoints on the current (Control) interface first.
-	in, out, _ = d.findEndpoints(d.controlIntf)
-	if in != nil && out != nil {
-		return in, out, nil
-	}
-
-	// 2. Scan for a Data interface if not already claimed
 	if d.dataIntf == nil {
-		for _, intfDesc := range d.usbc.Desc.Interfaces {
-			if intfDesc.Number == d.InterfaceNum {
-				continue
-			}
-			for _, alt := range intfDesc.AltSettings {
-				if len(alt.Endpoints) >= 2 {
-					fmt.Printf("USB DEBUG: Try claim intf %d alt %d\n", intfDesc.Number, alt.Number)
-					intf, err := d.usbc.Interface(intfDesc.Number, alt.Number)
-					if err != nil {
-						fmt.Printf("USB DEBUG: failed to claim intf %d alt %d: %v\n", intfDesc.Number, alt.Number, err)
-						if alt.Number != 0 {
-							fmt.Printf("USB DEBUG: trying fallback alt 0 for intf %d\n", intfDesc.Number)
-							intf, err = d.usbc.Interface(intfDesc.Number, 0)
-							if err != nil {
-								fmt.Printf("USB DEBUG: fallback failed: %v\n", err)
-								continue
-							}
-						} else {
-							continue
-						}
-					}
-					
-					in, out, _ = d.findEndpoints(intf)
-					if in != nil && out != nil {
-						fmt.Printf("USB DEBUG: Found bulk endpoints on intf %d alt %d\n", intfDesc.Number, alt.Number)
-						d.dataIntf = intf
-						return in, out, nil
-					} else {
-						fmt.Printf("USB DEBUG: Endpoints not found after claiming.\n")
-					}
-					intf.Close()
-				}
-			}
-		}
-	} else {
-		return d.findEndpoints(d.dataIntf)
+		return nil, nil, fmt.Errorf("usb: data interface not claimed")
 	}
-
-	return nil, nil, fmt.Errorf("could not find bulk endpoint pair")
-}
-
-func (d *Device) findEndpoints(intf *gousb.Interface) (*gousb.InEndpoint, *gousb.OutEndpoint, error) {
-	var in *gousb.InEndpoint
-	var out *gousb.OutEndpoint
-
-	for _, ep := range intf.Setting.Endpoints {
-		if ep.TransferType == gousb.TransferTypeBulk {
-			if ep.Direction == gousb.EndpointDirectionIn {
-				in, _ = intf.InEndpoint(ep.Number)
-			} else {
-				out, _ = intf.OutEndpoint(ep.Number)
-			}
+	for _, ep := range d.dataIntf.Setting.Endpoints {
+		if ep.TransferType != gousb.TransferTypeBulk {
+			continue
+		}
+		if ep.Direction == gousb.EndpointDirectionIn && in == nil {
+			in, err = d.dataIntf.InEndpoint(ep.Number)
+		} else if ep.Direction == gousb.EndpointDirectionOut && out == nil {
+			out, err = d.dataIntf.OutEndpoint(ep.Number)
+		}
+		if err != nil {
+			return nil, nil, err
 		}
 	}
 	if in == nil || out == nil {
-		return nil, nil, fmt.Errorf("missing endpoints")
+		return nil, nil, fmt.Errorf("usb: bulk endpoint pair not found")
 	}
 	return in, out, nil
 }

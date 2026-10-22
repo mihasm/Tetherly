@@ -9,6 +9,4 @@ type Interface interface {
 	io.ReadWriteCloser
 	Name() string
 	Configure(localIP, remoteIP, mtu string) error
-	SetDefaultRoute(gateway string) error
-	SetDNS(dnsServers []string) error
 }

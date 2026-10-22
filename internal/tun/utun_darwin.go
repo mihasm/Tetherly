@@ -31,26 +31,12 @@ func (i *utunInterface) Write(p []byte) (n int, err error) {
 	return i.f.Write(p)
 }
 
+// Close destroys the utun interface. Routes and DNS are owned by the netcfg
+// package and removed there before the interface goes away.
 func (i *utunInterface) Close() error {
-	// Cleanup routes we added
-	_ = exec.Command("route", "delete", "-net", "0.0.0.0/1").Run()
-	_ = exec.Command("route", "delete", "-net", "128.0.0.0/1").Run()
-
-	// Cleanup DNS we added
-	_ = exec.Command("scutil", "-w", "State:/Network/Service/droidtether/DNS").Run()
-	cmd := exec.Command("scutil")
-	stdin, _ := cmd.StdinPipe()
-	go func() {
-		defer stdin.Close()
-		fmt.Fprintln(stdin, "open")
-		fmt.Fprintln(stdin, "remove State:/Network/Service/droidtether/DNS")
-		fmt.Fprintln(stdin, "remove State:/Network/Global/DNS")
-		fmt.Fprintln(stdin, "quit")
-	}()
-	_ = cmd.Run()
-
 	return i.f.Close()
 }
+
 func (i *utunInterface) Name() string {
 	return i.name
 }
@@ -62,67 +48,6 @@ func (i *utunInterface) Configure(localIP, remoteIP, mtu string) error {
 	if out, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("ifconfig failed: %w (output: %s)", err, string(out))
 	}
-	return nil
-}
-
-// SetDefaultRoute adds "more specific" default routes (0.0.0.0/1 and 128.0.0.0/1)
-// to override the existing default route without deleting it.
-func (i *utunInterface) SetDefaultRoute(gateway string) error {
-	// 0.0.0.0/1
-	cmd1 := exec.Command("route", "add", "-net", "0.0.0.0/1", "-interface", i.name)
-	if out, err := cmd1.CombinedOutput(); err != nil {
-		return fmt.Errorf("failed to add 0/1 route: %w (output: %s)", err, string(out))
-	}
-
-	// 128.0.0.0/1
-	cmd2 := exec.Command("route", "add", "-net", "128.0.0.0/1", "-interface", i.name)
-	if out, err := cmd2.CombinedOutput(); err != nil {
-		return fmt.Errorf("failed to add 128/1 route: %w (output: %s)", err, string(out))
-	}
-
-	return nil
-}
-
-// SetDNS sets the system DNS to the phone gateway (or other provided servers)
-// using 'scutil' on macOS.
-func (i *utunInterface) SetDNS(dnsServers []string) error {
-	if len(dnsServers) == 0 {
-		return nil
-	}
-
-	cmd := exec.Command("scutil")
-	stdin, err := cmd.StdinPipe()
-	if err != nil {
-		return err
-	}
-
-	go func() {
-		defer stdin.Close()
-		fmt.Fprintln(stdin, "open")
-		fmt.Fprintln(stdin, "d.init")
-		fmt.Fprint(stdin, "d.add ServerAddresses *")
-		for _, s := range dnsServers {
-			fmt.Fprintf(stdin, " %s", s)
-		}
-		fmt.Fprintln(stdin)
-		// SupplementalMatchDomains set to empty string tells macOS to use these servers for ALL lookups.
-		fmt.Fprintln(stdin, "d.add SupplementalMatchDomains * \"\"")
-		fmt.Fprintln(stdin, "d.add SupplementalMatchOrders * 10")
-		fmt.Fprintln(stdin, "set State:/Network/Service/droidtether/DNS")
-		fmt.Fprintln(stdin, "set State:/Network/Global/DNS")
-
-		// Force Global IPv4 state to 'Online' via our utun interface
-		fmt.Fprintln(stdin, "d.init")
-		fmt.Fprintf(stdin, "d.add Router %s\n", dnsServers[len(dnsServers)-1]) // use phone gateway
-		fmt.Fprintf(stdin, "d.add Interface %s\n", i.name)
-		fmt.Fprintln(stdin, "set State:/Network/Global/IPv4")
-		fmt.Fprintln(stdin, "quit")
-	}()
-
-	if out, err := cmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("scutil DNS set failed: %w (output: %s)", err, string(out))
-	}
-
 	return nil
 }
 
@@ -181,6 +106,13 @@ func OpenUTUN(index int) (Interface, error) {
 	}
 
 	ifname := string(nameBuf[:nameLen-1]) // trim null byte
+
+	// Non-blocking so the Go poller owns the fd: Close then really interrupts a
+	// pending Read instead of leaving the interface (and a goroutine) behind.
+	if err := unix.SetNonblock(fd, true); err != nil {
+		unix.Close(fd)
+		return nil, fmt.Errorf("utun: failed to set non-blocking: %w", err)
+	}
 	return &utunInterface{
 		f:    os.NewFile(uintptr(fd), ifname),
 		name: ifname,

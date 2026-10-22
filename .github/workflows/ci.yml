@@ -2,38 +2,26 @@ name: CI
 
 on:
   push:
-    branches: [main, dev]
-  pull_request:
     branches: [main]
+  pull_request:
 
 jobs:
-  test:
-    name: Test
-    runs-on: macos-14  # Apple Silicon runner (M1)
-
+  build:
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
-
-      - name: Set up Go
-        uses: actions/setup-go@v5
+      - uses: actions/setup-go@v5
         with:
-          go-version: '1.22'
-
-      - name: Install dependencies (libusb + pkg-config)
+          go-version-file: go.mod
+      - name: Dependencies
         run: brew install libusb pkg-config
-
-      - name: Download dependencies
-        run: go mod download
-
       - name: Vet
         run: go vet ./...
-
       - name: Test
         run: go test -race ./...
-
-      - name: Build
-        run: make build
-        env:
-          CGO_ENABLED: 1
-          GOARCH: arm64
-          GOOS: darwin
+      - name: Build the app
+        run: scripts/build-app.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Tetherly
+          path: dist/*.zip
