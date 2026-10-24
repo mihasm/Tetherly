@@ -244,3 +244,6 @@ func dedupe(in []string) []string {
 	}
 	return out
 }
+
+// Phone is the phone this session runs on.
+func (s *Session) Phone() usb.DeviceInfo { return s.Device }

@@ -12,22 +12,36 @@ import (
 	"sync"
 	"time"
 
-	"github.com/google/gousb"
 	"github.com/mihasm/tetherly/internal/rndis"
 	"github.com/mihasm/tetherly/internal/tun"
 	"github.com/mihasm/tetherly/internal/usb"
 	"github.com/rs/zerolog/log"
 )
 
+// bulkIn and bulkOut are the parts of gousb's endpoints the relay uses.
+type bulkIn interface {
+	ReadContext(ctx context.Context, buf []byte) (int, error)
+}
+
+type bulkOut interface {
+	WriteContext(ctx context.Context, buf []byte) (int, error)
+}
+
 // Relay handles the packet shuttle between USB Bulk and Tunnel interface.
 type Relay struct {
-	dev    *usb.Device
 	tun    tun.Interface
 	ctx    context.Context
 	cancel context.CancelFunc
+	errc   chan error
 
-	usbIn  *gousb.InEndpoint
-	usbOut *gousb.OutEndpoint
+	usbIn    bulkIn
+	usbOut   bulkOut
+	inGuard  *endpointGuard
+	outGuard *endpointGuard // guarded by outMu, like every write to usbOut
+	outMu    sync.Mutex
+	clearFn  func(addr uint8) error
+	clearMu  sync.Mutex // held while a halt is cleared; Stop waits for it
+	stopped  bool
 
 	phoneMAC []byte
 	// OnDHCP is called once, on the first DHCPACK: the phone's gateway, our
@@ -52,18 +66,56 @@ func NewRelay(ctx context.Context, dev *usb.Device, tun tun.Interface, phoneMAC 
 	if err != nil {
 		return nil, err
 	}
+	return newRelay(ctx, in, out, uint8(in.Desc.Address), uint8(out.Desc.Address), dev.ClearHalt, tun, phoneMAC), nil
+}
 
+func newRelay(ctx context.Context, in bulkIn, out bulkOut, inAddr, outAddr uint8, clearHalt func(uint8) error, tun tun.Interface, phoneMAC []byte) *Relay {
 	ctx, cancel := context.WithCancel(ctx)
-	return &Relay{
-		dev:      dev,
+	r := &Relay{
 		tun:      tun,
 		ctx:      ctx,
 		cancel:   cancel,
+		errc:     make(chan error, 4),
 		usbIn:    in,
 		usbOut:   out,
+		clearFn:  clearHalt,
 		phoneMAC: phoneMAC,
 		leased:   make(chan struct{}),
-	}, nil
+	}
+	r.inGuard = newGuard("IN", inAddr, r.clearHalt, r.pause)
+	r.outGuard = newGuard("OUT", outAddr, r.clearHalt, r.pause)
+	return r
+}
+
+// die ends the relay with err (the first one wins).
+func (r *Relay) die(err error) {
+	select {
+	case r.errc <- err:
+	default:
+	}
+}
+
+// send writes one RNDIS message to the phone. A failed write is retried, and
+// a halted OUT endpoint cleared, until the guard gives up; then the relay ends.
+func (r *Relay) send(pkt []byte) error {
+	r.outMu.Lock()
+	defer r.outMu.Unlock()
+	for {
+		_, err := r.usbOut.WriteContext(r.ctx, pkt)
+		if err == nil {
+			r.outGuard.ok()
+			return nil
+		}
+		if r.ctx.Err() != nil {
+			return r.ctx.Err()
+		}
+		if ferr := r.outGuard.fail(err); ferr != nil {
+			if r.ctx.Err() == nil {
+				r.die(fmt.Errorf("relay: %w", ferr))
+			}
+			return ferr
+		}
+	}
 }
 
 // Stats returns the bytes sent to and received from the phone.
@@ -75,7 +127,6 @@ func (r *Relay) Stats() (sent, received uint64) {
 
 // Start spawns the relay goroutines and blocks until context is cancelled or an error occurs.
 func (r *Relay) Start() error {
-	errChan := make(chan error, 3)
 	// USB reads are cancelled through r.ctx; the tun read ends when the owner
 	// closes the interface. The device itself is closed by the owner too.
 
@@ -90,7 +141,7 @@ func (r *Relay) Start() error {
 				n, err := r.tun.Read(buf)
 				if err != nil {
 					if err != io.EOF && r.ctx.Err() == nil && !errors.Is(err, os.ErrClosed) {
-						errChan <- fmt.Errorf("relay: tun read error: %w", err)
+						r.die(fmt.Errorf("relay: tun read error: %w", err))
 					}
 					return
 				}
@@ -124,11 +175,7 @@ func (r *Relay) Start() error {
 
 				// Wrap in RNDIS and send
 				pkt := rndis.EncapsulatePacket(eth)
-				_, err = r.usbOut.WriteContext(r.ctx, pkt)
-				if err != nil {
-					if r.ctx.Err() == nil {
-						errChan <- fmt.Errorf("relay: usb write error: %w", err)
-					}
+				if err := r.send(pkt); err != nil {
 					return
 				}
 
@@ -142,7 +189,6 @@ func (r *Relay) Start() error {
 	// Phone -> Mac (USB -> Tunnel)
 	go func() {
 		buf := make([]byte, 16384)
-		usbErrors := 0
 		for {
 			select {
 			case <-r.ctx.Done():
@@ -153,22 +199,15 @@ func (r *Relay) Start() error {
 					if r.ctx.Err() != nil {
 						return
 					}
-					if errors.Is(err, gousb.ErrorNoDevice) || errors.Is(err, gousb.TransferNoDevice) {
-						errChan <- fmt.Errorf("relay: phone went away: %w", err)
+					if ferr := r.inGuard.fail(err); ferr != nil {
+						if r.ctx.Err() == nil {
+							r.die(fmt.Errorf("relay: %w", ferr))
+						}
 						return
 					}
-					usbErrors++
-					if usbErrors <= 5 || usbErrors%100 == 0 {
-						log.Warn().Str("component", "relay").Err(err).Int("count", usbErrors).Msg("USB IN read error (retrying)")
-					}
-					if usbErrors >= 200 {
-						errChan <- fmt.Errorf("relay: too many USB read errors: %w", err)
-						return
-					}
-					time.Sleep(50 * time.Millisecond)
 					continue
 				}
-				usbErrors = 0
+				r.inGuard.ok()
 
 				if n == 0 {
 					continue
@@ -237,7 +276,7 @@ func (r *Relay) Start() error {
 		time.Sleep(500 * time.Millisecond)
 		discover := rndis.EncapsulatePacket(r.buildDHCPDiscover())
 		log.Info().Str("component", "relay").Msg("Sending DHCP Discover...")
-		_, _ = r.usbOut.WriteContext(r.ctx, discover)
+		_ = r.send(discover)
 		retry := time.NewTicker(3 * time.Second)
 		defer retry.Stop()
 		var renew <-chan time.Time
@@ -249,7 +288,7 @@ func (r *Relay) Start() error {
 				return
 			case <-retry.C:
 				log.Info().Str("component", "relay").Msg("No DHCP lease yet, sending Discover again...")
-				_, _ = r.usbOut.WriteContext(r.ctx, discover)
+				_ = r.send(discover)
 			case <-leased:
 				leased = nil
 				retry.Stop()
@@ -268,10 +307,10 @@ func (r *Relay) Start() error {
 					half = 30 * time.Second
 				}
 				log.Info().Str("component", "relay").Str("ip", ip.String()).Msg("Renewing DHCP lease")
-				_, _ = r.usbOut.WriteContext(r.ctx, rndis.EncapsulatePacket(r.buildDHCPRequest(ip, srv)))
+				_ = r.send(rndis.EncapsulatePacket(r.buildDHCPRequest(ip, srv)))
 				renew = time.After(half)
 			case <-ticker.C:
-				_, _ = r.usbOut.WriteContext(r.ctx, dummyPkt)
+				_ = r.send(dummyPkt)
 			}
 		}
 	}()
@@ -279,7 +318,7 @@ func (r *Relay) Start() error {
 	log.Info().Str("component", "relay").Msg("Bidirectional packet relay started")
 
 	select {
-	case err := <-errChan:
+	case err := <-r.errc:
 		r.cancel()
 		return err
 	case <-r.ctx.Done():
@@ -599,6 +638,30 @@ func (r *Relay) inspectPacket(data []byte, direction string) {
 // Stop shuts down the relay.
 func (r *Relay) Stop() {
 	r.cancel()
+	// wait for a halt clear in progress: the owner closes the device next
+	r.clearMu.Lock()
+	r.stopped = true
+	r.clearMu.Unlock()
+}
+
+// clearHalt clears an endpoint halt unless the relay has stopped.
+func (r *Relay) clearHalt(addr uint8) error {
+	r.clearMu.Lock()
+	defer r.clearMu.Unlock()
+	if r.stopped || r.ctx.Err() != nil {
+		return context.Canceled
+	}
+	return r.clearFn(addr)
+}
+
+// pause waits d, or less when the relay stops.
+func (r *Relay) pause(d time.Duration) {
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-t.C:
+	case <-r.ctx.Done():
+	}
 }
 
 // writeUSB sends a control-plane frame (ARP, DHCP) to the phone.
@@ -606,5 +669,5 @@ func (r *Relay) writeUSB(pkt []byte) {
 	if r.usbOut == nil {
 		return
 	}
-	_, _ = r.usbOut.Write(pkt)
+	_ = r.send(pkt)
 }

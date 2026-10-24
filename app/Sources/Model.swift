@@ -193,7 +193,12 @@ final class Model: ObservableObject {
             body = new?.error ?? ""
         case ("connected", _):
             title = "Tethering disconnected"
-            body = n == "no_phone" ? "The phone was unplugged." : (n == "phone_found" ? "USB tethering was switched off on the phone." : "")
+            switch n {
+            case "no_phone": body = "The phone was unplugged."
+            case "phone_found": body = "USB tethering was switched off on the phone."
+            case "connecting": body = "Reconnecting."
+            default: body = ""
+            }
         case (_, "tethering_available") where !(new?.auto_connect ?? false):
             title = "Phone ready for USB tethering"
             body = "Click Connect in the menu bar."

@@ -31,15 +31,38 @@ var ConfigFile = "/Library/Application Support/Tetherly/config.json"
 
 const dhcpTimeout = 25 * time.Second
 
+// tetherSession is what the helper needs of a tether.Session.
+type tetherSession interface {
+	Phone() usb.DeviceInfo
+	Done() <-chan struct{}
+	Err() error
+	Info() *tether.Info
+	Stop()
+	Interface() string
+	Stats() (tx, rx uint64)
+}
+
+func startTether(info usb.DeviceInfo, p tether.Params) (tetherSession, error) {
+	s, err := tether.Start(info, p, nil)
+	if err != nil {
+		return nil, err
+	}
+	return s, nil
+}
+
 // Helper is the daemon state. All fields are guarded by mu.
 type Helper struct {
-	version string
+	version  string
+	discover func() ([]usb.DeviceInfo, error)
+	start    func(usb.DeviceInfo, tether.Params) (tetherSession, error)
 
 	mu         sync.Mutex
 	cfg        ipc.Config
 	phone      *usb.DeviceInfo
-	sess       *tether.Session
+	sess       tetherSession
 	sessStart  time.Time
+	want       *wanted // a connection the user asked for; nil after disconnect
+	gen        int     // counts disconnects, so a connect that was overtaken by one gives up
 	connecting bool
 	lastErr    string
 	manualOff  map[string]bool
@@ -50,7 +73,7 @@ type Helper struct {
 
 // New loads the configuration and returns a helper.
 func New(version string) *Helper {
-	h := &Helper{version: version, cfg: loadConfig(), manualOff: map[string]bool{}, lastClient: time.Now()}
+	h := &Helper{version: version, discover: usb.Discover, start: startTether, cfg: loadConfig(), manualOff: map[string]bool{}, lastClient: time.Now()}
 	return h
 }
 
@@ -120,7 +143,7 @@ func (h *Helper) Run(stop <-chan struct{}, idleExit time.Duration) {
 func (h *Helper) idle(after time.Duration) bool {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	return h.sess == nil && !h.connecting && !h.cfg.AutoConnect && time.Since(h.lastClient) > after
+	return h.sess == nil && !h.connecting && h.want == nil && !h.cfg.AutoConnect && time.Since(h.lastClient) > after
 }
 
 func (h *Helper) shutdown() {
@@ -134,7 +157,7 @@ func (h *Helper) shutdown() {
 }
 
 func (h *Helper) tick() {
-	phones, err := usb.Discover()
+	phones, err := h.discover()
 	if err != nil {
 		log.Warn().Err(err).Msg("USB discovery failed")
 		return
@@ -144,9 +167,19 @@ func (h *Helper) tick() {
 	if len(phones) > 0 {
 		cur = &phones[0]
 	}
+	// a wanted connection waits for its own phone
+	if h.want != nil {
+		for i := range phones {
+			if samePhone(&h.want.phone, &phones[i]) {
+				cur = &phones[i]
+				break
+			}
+		}
+	}
 	// a session keeps its own phone while it is still on the bus
 	if h.sess != nil {
-		k := key(&h.sess.Device)
+		p := h.sess.Phone()
+		k := key(&p)
 		cur = nil
 		for i := range phones {
 			if key(&phones[i]) == k {
@@ -184,11 +217,20 @@ func (h *Helper) tick() {
 			h.sess = nil
 			// a session that died because the phone left or stopped tethering is a
 			// normal end, not an error
-			if err := sess.Err(); err != nil && cur != nil && cur.HasRNDIS {
+			err := sess.Err()
+			if err != nil && cur != nil && cur.HasRNDIS {
 				h.setErr(err.Error())
 			}
+			reason := "session ended"
+			if err != nil {
+				reason = err.Error()
+			}
+			h.sessionEnded(reason)
 			sess = nil
 		default:
+			if h.failures > 0 && sess.Info() != nil && time.Since(h.sessStart) > stableSession {
+				h.failures = 0
+			}
 		}
 	}
 	h.mu.Unlock()
@@ -197,24 +239,62 @@ func (h *Helper) tick() {
 		switch {
 		case cur == nil:
 			log.Info().Msg("Phone unplugged: disconnecting")
-			h.endSession(sess, "")
+			h.endSession(sess, "", "the phone left the USB bus")
 		case !cur.HasRNDIS:
 			log.Info().Msg("USB tethering switched off on the phone: disconnecting")
-			h.endSession(sess, "")
+			h.endSession(sess, "", "the phone stopped offering USB tethering")
 		case sess.Info() == nil && time.Since(h.sessStartTime()) > dhcpTimeout:
-			h.endSession(sess, "the phone gave no IP address (no DHCP answer) - is mobile data on?")
+			msg := "the phone gave no IP address (no DHCP answer) - is mobile data on?"
+			h.endSession(sess, msg, msg)
 		}
 		return
 	}
 
 	h.mu.Lock()
-	auto := h.cfg.AutoConnect && cur != nil && cur.HasRNDIS && !h.connecting &&
-		!h.manualOff[curKey] && time.Now().After(h.nextAuto)
+	ready := cur != nil && cur.HasRNDIS && !h.connecting && time.Now().After(h.nextAuto)
+	var reconnect *wanted
+	if h.want != nil && !h.connecting {
+		switch step, _, why := h.want.step(time.Now(), phones); step {
+		case wishDrop:
+			log.Info().Str("phone", h.want.phone.Product).Str("reason", why).Str("last_end", h.want.reason).Msg("Not reconnecting")
+			h.want = nil
+		case wishReconnect:
+			if ready {
+				w := *h.want
+				reconnect = &w
+			}
+		}
+	}
+	auto := h.want == nil && ready && h.cfg.AutoConnect && !h.manualOff[curKey]
+	attempt := h.failures + 1
 	h.mu.Unlock()
-	if auto {
+	switch {
+	case reconnect != nil:
+		l := log.Info().Str("phone", cur.Product).Str("id", cur.VIDPID).Str("after", reconnect.reason).Int("attempt", attempt)
+		if !reconnect.ended.IsZero() {
+			l = l.Dur("down", time.Since(reconnect.ended).Round(100*time.Millisecond))
+		}
+		l.Msg("Reconnecting")
+		go h.connect()
+	case auto:
 		log.Info().Msg("Auto-connect: the phone offers USB tethering")
 		go h.connect()
 	}
+}
+
+// sessionEnded records the end of a session the user did not stop (h.mu
+// held): the wish stays, and the next attempt waits for the backoff unless
+// the session had been running steadily.
+func (h *Helper) sessionEnded(reason string) {
+	if h.want == nil {
+		return
+	}
+	h.want.ended, h.want.reason = time.Now(), reason
+	if time.Since(h.sessStart) > stableSession {
+		h.failures = 0
+	}
+	h.nextAuto = time.Now().Add(backoff(h.failures))
+	h.failures++
 }
 
 func (h *Helper) sessStartTime() time.Time {
@@ -230,11 +310,16 @@ func (h *Helper) setErr(msg string) {
 	}
 }
 
-func (h *Helper) endSession(s *tether.Session, errMsg string) {
+// endSession stops s. reason, when not empty, is why the helper ended it
+// itself: a wanted connection is then started again; a disconnect passes "".
+func (h *Helper) endSession(s tetherSession, errMsg, reason string) {
 	s.Stop()
 	h.mu.Lock()
 	if h.sess == s {
 		h.sess = nil
+		if reason != "" {
+			h.sessionEnded(reason)
+		}
 	}
 	if errMsg != "" {
 		h.setErr(errMsg)
@@ -264,27 +349,31 @@ func (h *Helper) connect() error {
 	delete(h.manualOff, key(phone))
 	cfg := h.cfg
 	info := *phone
+	gen := h.gen
 	h.mu.Unlock()
 
 	log.Info().Str("phone", info.Product).Msg("Connecting")
-	s, err := tether.Start(info, tether.Params{MTU: cfg.MTU, RouteAll: cfg.RouteAll, ManageDNS: cfg.ManageDNS, DNSServers: cfg.DNSServers}, nil)
+	s, err := h.start(info, tether.Params{MTU: cfg.MTU, RouteAll: cfg.RouteAll, ManageDNS: cfg.ManageDNS, DNSServers: cfg.DNSServers})
 
 	h.mu.Lock()
-	defer h.mu.Unlock()
 	h.connecting = false
 	if err != nil {
 		h.failures++
-		backoff := time.Duration(5<<min(h.failures-1, 4)) * time.Second
-		if backoff > time.Minute {
-			backoff = time.Minute
-		}
-		h.nextAuto = time.Now().Add(backoff)
+		h.nextAuto = time.Now().Add(backoff(h.failures))
 		h.setErr(fmt.Sprintf("connect failed: %v", err))
+		h.mu.Unlock()
 		return err
 	}
-	h.failures = 0
+	if gen != h.gen {
+		// disconnect came while this was starting
+		h.mu.Unlock()
+		s.Stop()
+		return errors.New("disconnected while connecting")
+	}
 	h.sess = s
 	h.sessStart = time.Now()
+	h.want = &wanted{phone: info}
+	h.mu.Unlock()
 	return nil
 }
 
@@ -295,10 +384,15 @@ func (h *Helper) disconnect() {
 		h.manualOff[key(h.phone)] = true
 	}
 	h.lastErr = ""
+	pending := h.want != nil
+	h.want = nil
+	h.gen++
 	h.mu.Unlock()
 	if s != nil {
 		log.Info().Msg("Disconnect requested")
-		h.endSession(s, "")
+		h.endSession(s, "", "")
+	} else if pending {
+		log.Info().Msg("Disconnect requested: reconnecting stopped")
 	}
 }
 
@@ -323,6 +417,18 @@ func (h *Helper) Status() ipc.Status {
 		}
 	case h.connecting:
 		st.State = ipc.StateConnecting
+	case h.want != nil:
+		// a wanted connection between sessions: Disconnect stops it
+		st.State = ipc.StateConnecting
+		st.Error = h.lastErr
+		switch {
+		case h.phone == nil || !samePhone(&h.want.phone, h.phone):
+			st.Hint = "Waiting for the phone to come back"
+		case !h.phone.HasRNDIS:
+			st.Hint = "Waiting for USB tethering on the phone"
+		default:
+			st.Hint = "Reconnecting"
+		}
 	case h.lastErr != "":
 		st.State = ipc.StateError
 		st.Error = h.lastErr
